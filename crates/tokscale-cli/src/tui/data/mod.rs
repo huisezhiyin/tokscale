@@ -126,9 +126,8 @@ impl DataLoader {
         let pricing_result = rt.block_on(async { PricingService::get_or_init().await });
         let pricing = pricing_result.as_ref().ok();
 
-        // Always parse only enabled clients. Synthetic re-attribution (Strategy 1)
-        // runs on these messages after parsing — it doesn't need ALL clients, just the
-        // ones the user actually enabled. Octofriend SQLite (Strategy 2) is handled
+        // Always parse only enabled clients. Synthetic gateway detection runs on these
+        // messages after parsing, while Octofriend SQLite (Strategy 2) is handled
         // separately by the scanner when "synthetic" is in the sources list.
         let clients_to_parse: Vec<ClientId> = enabled_clients.to_vec();
 
@@ -295,18 +294,10 @@ impl DataLoader {
             }
 
             for msg in &mut all_messages {
-                if msg.client == "synthetic" {
-                    continue;
-                }
-                if sessions::synthetic::is_synthetic_model(&msg.model_id)
-                    || sessions::synthetic::is_synthetic_provider(&msg.provider_id)
-                {
-                    msg.client = "synthetic".to_string();
-                    msg.model_id = sessions::synthetic::normalize_synthetic_model(&msg.model_id);
-                    if !msg.provider_id.is_empty() {
-                        msg.provider_id = "synthetic".to_string();
-                    }
-                }
+                sessions::synthetic::normalize_synthetic_gateway_fields(
+                    &mut msg.model_id,
+                    &mut msg.provider_id,
+                );
             }
         }
 
@@ -317,7 +308,15 @@ impl DataLoader {
         if include_synthetic {
             requested_clients.insert("synthetic".to_string());
         }
-        all_messages.retain(|msg| requested_clients.contains(&msg.client));
+        all_messages.retain(|msg| {
+            requested_clients.contains(&msg.client)
+                || (include_synthetic
+                    && sessions::synthetic::matches_synthetic_filter(
+                        &msg.client,
+                        &msg.model_id,
+                        &msg.provider_id,
+                    ))
+        });
 
         if let Some(svc) = pricing {
             for msg in &mut all_messages {
@@ -956,5 +955,17 @@ mod tests {
         let (current, longest) = calculate_streaks_for_today(&daily, today);
         assert_eq!(current, 2);
         assert_eq!(longest, 2);
+    }
+
+    #[test]
+    fn test_synthetic_filter_match_keeps_gateway_messages_with_original_client() {
+        assert!(sessions::synthetic::matches_synthetic_filter(
+            "opencode",
+            "hf:deepseek-ai/DeepSeek-V3-0324",
+            "unknown"
+        ));
+        assert!(!sessions::synthetic::matches_synthetic_filter(
+            "opencode", "gpt-5.2", "openai"
+        ));
     }
 }
