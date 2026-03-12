@@ -245,7 +245,11 @@ impl DataLoader {
             }
 
             if let Some(agent) = msg.agent.as_ref() {
-                let normalized_agent = sessions::normalize_agent_name(agent);
+                let normalized_agent = if msg.client == "opencode" {
+                    sessions::normalize_opencode_agent_name(agent)
+                } else {
+                    sessions::normalize_agent_name(agent)
+                };
                 let agent_entry = agent_map
                     .entry(normalized_agent.clone())
                     .or_insert_with(|| AgentUsage {
@@ -814,6 +818,106 @@ mod tests {
         assert_eq!(usage.agents[0].message_count, 2);
         assert!((usage.agents[0].cost - 4.0).abs() < f64::EPSILON);
         assert_eq!(usage.agents[0].tokens.total(), 45);
+    }
+
+    #[test]
+    fn test_aggregate_messages_merges_oh_my_opencode_agent_variants() {
+        let loader = DataLoader::new(None);
+        let messages = vec![
+            UnifiedMessage::new_with_agent(
+                "opencode",
+                "claude-opus-4-6",
+                "anthropic",
+                "session-1",
+                1_735_689_600_000,
+                tokscale_core::TokenBreakdown {
+                    input: 10,
+                    output: 5,
+                    cache_read: 100,
+                    cache_write: 20,
+                    reasoning: 0,
+                },
+                1.5,
+                Some("Sisyphus".to_string()),
+            ),
+            UnifiedMessage::new_with_agent(
+                "opencode",
+                "claude-opus-4-6",
+                "anthropic",
+                "session-2",
+                1_735_689_700_000,
+                tokscale_core::TokenBreakdown {
+                    input: 20,
+                    output: 10,
+                    cache_read: 200,
+                    cache_write: 40,
+                    reasoning: 0,
+                },
+                2.5,
+                Some("Sisyphus (Ultraworker)".to_string()),
+            ),
+        ];
+
+        let usage = loader
+            .aggregate_messages(messages, &GroupBy::Model)
+            .unwrap();
+
+        assert_eq!(usage.agents.len(), 1);
+        assert_eq!(usage.agents[0].agent, "Sisyphus");
+        assert_eq!(usage.agents[0].clients, "opencode");
+        assert_eq!(usage.agents[0].message_count, 2);
+        assert!((usage.agents[0].cost - 4.0).abs() < f64::EPSILON);
+        assert_eq!(usage.agents[0].tokens.total(), 405);
+    }
+
+    #[test]
+    fn test_aggregate_messages_does_not_merge_omo_variants_for_non_opencode_clients() {
+        let loader = DataLoader::new(None);
+        let messages = vec![
+            UnifiedMessage::new_with_agent(
+                "claude",
+                "claude-opus-4-6",
+                "anthropic",
+                "session-1",
+                1_735_689_600_000,
+                tokscale_core::TokenBreakdown {
+                    input: 10,
+                    output: 5,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                1.5,
+                Some("Sisyphus".to_string()),
+            ),
+            UnifiedMessage::new_with_agent(
+                "claude",
+                "claude-opus-4-6",
+                "anthropic",
+                "session-2",
+                1_735_689_700_000,
+                tokscale_core::TokenBreakdown {
+                    input: 20,
+                    output: 10,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                2.5,
+                Some("Sisyphus (Ultraworker)".to_string()),
+            ),
+        ];
+
+        let usage = loader
+            .aggregate_messages(messages, &GroupBy::Model)
+            .unwrap();
+
+        assert_eq!(usage.agents.len(), 2);
+        assert!(usage.agents.iter().any(|agent| agent.agent == "Sisyphus"));
+        assert!(usage
+            .agents
+            .iter()
+            .any(|agent| agent.agent == "Sisyphus (Ultraworker)"));
     }
 
     #[test]
