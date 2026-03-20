@@ -60,7 +60,7 @@ export function HeroSection({ stargazersCount }: HeroSectionProps) {
               <HeroButtonsRow>
                 <CTAWrapper>
                   <StarButton
-                    href="https://github.com/junhoyeo/tokscale"
+                    href="https://github.com/huisezhiyin/tokscale"
                     target="_blank"
                     rel="noopener noreferrer"
                   >
@@ -137,7 +137,7 @@ export function HeroSection({ stargazersCount }: HeroSectionProps) {
             >
               Based on{" "}
               <TooltipLink
-                href="https://github.com/junhoyeo/tokscale"
+                href="https://github.com/huisezhiyin/tokscale"
                 target="_blank"
                 rel="noopener noreferrer"
               >

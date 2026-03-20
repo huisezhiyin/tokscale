@@ -158,19 +158,19 @@ Version is stored in 3 places (all updated by CI):
 ```markdown
 <div align="center">
 
-[![Tokscale](https://github.com/junhoyeo/tokscale/raw/main/.github/assets/hero-v2.png)](https://github.com/junhoyeo/tokscale)
+[![Tokscale](https://github.com/huisezhiyin/tokscale/raw/main/.github/assets/hero-v2.png)](https://github.com/huisezhiyin/tokscale)
 
 # `tokscale@vX.Y.Z` is here!
 </div>
 
 ## What's Changed
-* scope(area): description by @author in https://github.com/junhoyeo/tokscale/pull/NNN
-* scope(area): description by @author in https://github.com/junhoyeo/tokscale/pull/NNN
+* scope(area): description by @author in https://github.com/huisezhiyin/tokscale/pull/NNN
+* scope(area): description by @author in https://github.com/huisezhiyin/tokscale/pull/NNN
 
 ## New Contributors
-* @username made their first contribution in https://github.com/junhoyeo/tokscale/pull/NNN
+* @username made their first contribution in https://github.com/huisezhiyin/tokscale/pull/NNN
 
-**Full Changelog**: https://github.com/junhoyeo/tokscale/compare/vPREVIOUS...vNEW
+**Full Changelog**: https://github.com/huisezhiyin/tokscale/compare/vPREVIOUS...vNEW
 ```
 
 #### Style Rules

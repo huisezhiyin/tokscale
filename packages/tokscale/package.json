@@ -10,12 +10,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/junhoyeo/tokscale.git"
+    "url": "git+https://github.com/huisezhiyin/tokscale.git"
   },
   "bugs": {
-    "url": "https://github.com/junhoyeo/tokscale/issues"
+    "url": "https://github.com/huisezhiyin/tokscale/issues"
   },
-  "homepage": "https://github.com/junhoyeo/tokscale#readme",
+  "homepage": "https://github.com/huisezhiyin/tokscale#readme",
   "keywords": [
     "token",
     "tracker",

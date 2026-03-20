@@ -745,7 +745,7 @@ async fn generate_wrapped_image(data: &WrappedData, options: &RenderOptions) -> 
                 COLOR_TEXT_SECONDARY,
                 PADDING,
                 footer_bottom_y,
-                "github.com/junhoyeo/tokscale",
+                "github.com/huisezhiyin/tokscale",
             );
 
             let logo_width = ((logo.width() as f32 / logo.height() as f32)

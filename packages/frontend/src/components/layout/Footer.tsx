@@ -229,11 +229,11 @@ export function Footer() {
               © 2025 Tokscale. All rights reserved.
             </CopyrightText>
             <GitHubLink 
-              href="https://github.com/junhoyeo/tokscale" 
+              href="https://github.com/huisezhiyin/tokscale" 
               target="_blank" 
               rel="noopener noreferrer"
             >
-              github.com/junhoyeo/tokscale
+              github.com/huisezhiyin/tokscale
             </GitHubLink>
           </TextContainer>
         </ContentContainer>

@@ -703,7 +703,7 @@ export function Navigation() {
           </NavItemLink>
           <NavItemBase
             as="a"
-            href="https://github.com/junhoyeo/tokscale"
+            href="https://github.com/huisezhiyin/tokscale"
             target="_blank"
             rel="noopener noreferrer"
             $isActive={false}
@@ -746,7 +746,7 @@ export function Navigation() {
             Profile
           </DropdownNavLink>
           <DropdownNavLinkExternal
-            href="https://github.com/junhoyeo/tokscale"
+            href="https://github.com/huisezhiyin/tokscale"
             target="_blank"
             rel="noopener noreferrer"
             $isActive={false}

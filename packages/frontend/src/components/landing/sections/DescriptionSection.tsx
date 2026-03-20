@@ -29,7 +29,7 @@ export function DescriptionSection() {
       </ClientLogosContainer>
 
       <GitHubBtn
-        href="https://github.com/junhoyeo/tokscale"
+        href="https://github.com/huisezhiyin/tokscale"
         target="_blank"
         rel="noopener noreferrer"
       >

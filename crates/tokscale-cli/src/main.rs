@@ -2710,7 +2710,7 @@ fn prompt_star_repo(username: &str) -> Result<()> {
     );
     println!(
         "  {}\n",
-        osc8_link("https://github.com/junhoyeo/tokscale").bright_black()
+        osc8_link("https://github.com/huisezhiyin/tokscale").bright_black()
     );
     print!(
         "{}",

@@ -79,7 +79,7 @@ export function BlackholeHero() {
             </StarText>
           </StarContainer>
           <GitHubLink
-            href="https://github.com/junhoyeo/tokscale"
+            href="https://github.com/huisezhiyin/tokscale"
             target="_blank"
             rel="noopener noreferrer"
           >
