@@ -292,11 +292,7 @@ pub fn parse_codex_file(path: &Path) -> Vec<UnifiedMessage> {
                         .map(|dt| dt.timestamp_millis())
                         .unwrap_or(fallback_timestamp);
 
-                    let agent = if session_is_headless {
-                        Some("headless".to_string())
-                    } else {
-                        session_agent.clone()
-                    };
+                    let agent = codex_agent_name(session_is_headless, &session_agent);
 
                     let provider = session_provider.as_deref().unwrap_or("openai");
 
@@ -418,6 +414,14 @@ fn parse_codex_headless_line(
         0.0,
         agent,
     ))
+}
+
+fn codex_agent_name(session_is_headless: bool, session_agent: &Option<String>) -> Option<String> {
+    if session_is_headless {
+        Some("headless".to_string())
+    } else {
+        session_agent.clone().or_else(|| Some("Codex".to_string()))
+    }
 }
 
 fn extract_headless_usage(value: &Value) -> Option<CodexHeadlessUsage> {
@@ -823,6 +827,20 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].provider_id, "azure");
         assert_eq!(messages[0].agent.as_deref(), Some("my-agent"));
+    }
+
+    #[test]
+    fn test_interactive_sessions_without_agent_nickname_fall_back_to_codex() {
+        let line1 = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"source":"interactive","model_provider":"openai"}}"#;
+        let line2 = r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#;
+        let line3 = r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1}}}}"#;
+        let content = format!("{}\n{}\n{}", line1, line2, line3);
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].agent.as_deref(), Some("Codex"));
     }
 
     #[test]

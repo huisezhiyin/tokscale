@@ -196,7 +196,7 @@ fn get_empty_message(app: &App) -> String {
             .all(|client| *client == ClientId::Codex);
 
     if only_codex {
-        "No agent breakdown is available for the current sources.\nThe selected source usually does not record agent metadata for regular sessions.\nPress 's' to try a different source."
+        "No agent breakdown is available for the current sources.\nNo Codex usage was found for the current filters.\nPress 's' to try a different source or 'r' to refresh."
             .to_string()
     } else {
         "No agent breakdown is available for the current sources.\nOnly some sources record agent metadata.\nPress 's' to change sources or 'r' to refresh."
@@ -259,8 +259,8 @@ mod tests {
         let app = make_app(vec![ClientId::Codex]);
         let message = get_empty_message(&app);
 
-        assert!(message.contains("selected source usually does not record"));
-        assert!(message.contains("try a different source"));
+        assert!(message.contains("No Codex usage was found"));
+        assert!(message.contains("refresh"));
     }
 
     #[test]

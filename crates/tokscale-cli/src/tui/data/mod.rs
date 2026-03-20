@@ -821,6 +821,37 @@ mod tests {
     }
 
     #[test]
+    fn test_aggregate_messages_includes_codex_fallback_agent() {
+        let loader = DataLoader::new(None);
+        let messages = vec![UnifiedMessage::new_with_agent(
+            "codex",
+            "gpt-5.2",
+            "openai",
+            "session-1",
+            1_735_689_600_000,
+            tokscale_core::TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 2,
+                cache_write: 0,
+                reasoning: 1,
+            },
+            0.0,
+            Some("Codex".to_string()),
+        )];
+
+        let usage = loader
+            .aggregate_messages(messages, &GroupBy::Model)
+            .unwrap();
+
+        assert_eq!(usage.agents.len(), 1);
+        assert_eq!(usage.agents[0].agent, "Codex");
+        assert_eq!(usage.agents[0].clients, "codex");
+        assert_eq!(usage.agents[0].message_count, 1);
+        assert_eq!(usage.agents[0].tokens.total(), 18);
+    }
+
+    #[test]
     fn test_aggregate_messages_merges_oh_my_opencode_agent_variants() {
         let loader = DataLoader::new(None);
         let messages = vec![
