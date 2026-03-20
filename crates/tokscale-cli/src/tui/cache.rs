@@ -13,13 +13,14 @@ use serde::{Deserialize, Serialize};
 use tokscale_core::ClientId;
 
 use super::data::{
-    AgentUsage, ContributionDay, DailyModelInfo, DailyUsage, GraphData, ModelUsage, TokenBreakdown,
-    UsageData,
+    AgentUsage, ContributionDay, CurrentSession, DailyModelInfo, DailyUsage, GraphData, ModelUsage,
+    NowPhaseCounts, TokenBreakdown, UsageData,
 };
+use tokscale_core::CodexActivityPhase;
 
 /// Cache staleness threshold: 5 minutes (matches TS implementation)
 const CACHE_STALE_THRESHOLD_MS: u64 = 5 * 60 * 1000;
-const CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_SCHEMA_VERSION: u32 = 3;
 
 /// Get the cache directory path
 /// Uses `~/.cache/tokscale/` to match TypeScript implementation for cache sharing
@@ -56,8 +57,43 @@ struct CachedUsageData {
     graph: Option<CachedGraphData>,
     total_tokens: u64,
     total_cost: f64,
+    #[serde(default)]
+    now_sessions: Vec<CachedCurrentSession>,
+    #[serde(default)]
+    now_phase_counts: CachedNowPhaseCounts,
+    #[serde(default)]
+    now_updated_at_ms: Option<i64>,
     current_streak: u32,
     longest_streak: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedNowPhaseCounts {
+    streaming: u32,
+    settling: u32,
+    preparing: u32,
+    idle: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedCurrentSession {
+    client: String,
+    session_id: String,
+    model: String,
+    provider: String,
+    agent: Option<String>,
+    cwd: Option<String>,
+    repo_name: Option<String>,
+    session_kind: String,
+    phase: String,
+    last_event_at_ms: i64,
+    last_token_at_ms: Option<i64>,
+    last_event_age_seconds: i64,
+    last_token_age_seconds: Option<i64>,
+    total_tokens: u64,
+    recent_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,6 +342,72 @@ impl TryFrom<CachedGraphData> for GraphData {
     }
 }
 
+impl From<&NowPhaseCounts> for CachedNowPhaseCounts {
+    fn from(counts: &NowPhaseCounts) -> Self {
+        Self {
+            streaming: counts.streaming,
+            settling: counts.settling,
+            preparing: counts.preparing,
+            idle: counts.idle,
+        }
+    }
+}
+
+impl From<CachedNowPhaseCounts> for NowPhaseCounts {
+    fn from(counts: CachedNowPhaseCounts) -> Self {
+        Self {
+            streaming: counts.streaming,
+            settling: counts.settling,
+            preparing: counts.preparing,
+            idle: counts.idle,
+        }
+    }
+}
+
+impl From<&CurrentSession> for CachedCurrentSession {
+    fn from(session: &CurrentSession) -> Self {
+        Self {
+            client: session.client.clone(),
+            session_id: session.session_id.clone(),
+            model: session.model.clone(),
+            provider: session.provider.clone(),
+            agent: session.agent.clone(),
+            cwd: session.cwd.clone(),
+            repo_name: session.repo_name.clone(),
+            session_kind: session.session_kind.clone(),
+            phase: session.phase.as_str().to_string(),
+            last_event_at_ms: session.last_event_at_ms,
+            last_token_at_ms: session.last_token_at_ms,
+            last_event_age_seconds: session.last_event_age_seconds,
+            last_token_age_seconds: session.last_token_age_seconds,
+            total_tokens: session.total_tokens,
+            recent_tokens: session.recent_tokens,
+        }
+    }
+}
+
+impl From<CachedCurrentSession> for CurrentSession {
+    fn from(session: CachedCurrentSession) -> Self {
+        Self {
+            client: session.client,
+            session_id: session.session_id,
+            model: session.model,
+            provider: session.provider,
+            agent: session.agent,
+            cwd: session.cwd,
+            repo_name: session.repo_name,
+            session_kind: session.session_kind,
+            phase: parse_phase(&session.phase),
+            last_event_at_ms: session.last_event_at_ms,
+            last_token_at_ms: session.last_token_at_ms,
+            last_event_age_seconds: session.last_event_age_seconds,
+            last_token_age_seconds: session.last_token_age_seconds,
+            total_tokens: session.total_tokens,
+            recent_tokens: session.recent_tokens,
+        }
+    }
+}
+
 impl From<&UsageData> for CachedUsageData {
     fn from(u: &UsageData) -> Self {
         Self {
@@ -315,6 +417,9 @@ impl From<&UsageData> for CachedUsageData {
             graph: u.graph.as_ref().map(|g| g.into()),
             total_tokens: u.total_tokens,
             total_cost: u.total_cost,
+            now_sessions: u.now_sessions.iter().map(|s| s.into()).collect(),
+            now_phase_counts: (&u.now_phase_counts).into(),
+            now_updated_at_ms: u.now_updated_at_ms,
             current_streak: u.current_streak,
             longest_streak: u.longest_streak,
         }
@@ -335,11 +440,23 @@ impl TryFrom<CachedUsageData> for UsageData {
             graph: graph.transpose()?,
             total_tokens: u.total_tokens,
             total_cost: u.total_cost,
+            now_sessions: u.now_sessions.into_iter().map(|s| s.into()).collect(),
+            now_phase_counts: u.now_phase_counts.into(),
+            now_updated_at_ms: u.now_updated_at_ms,
             loading: false,
             error: None,
             current_streak: u.current_streak,
             longest_streak: u.longest_streak,
         })
+    }
+}
+
+fn parse_phase(phase: &str) -> CodexActivityPhase {
+    match phase {
+        "streaming" => CodexActivityPhase::Streaming,
+        "settling" => CodexActivityPhase::Settling,
+        "preparing" => CodexActivityPhase::Preparing,
+        _ => CodexActivityPhase::Idle,
     }
 }
 

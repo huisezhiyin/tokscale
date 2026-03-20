@@ -45,6 +45,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
     let is_very_narrow = app.is_very_narrow();
+    let is_now = app.current_tab == Tab::Now;
 
     // Split into left (sort buttons) and right (totals)
     let chunks = Layout::default()
@@ -60,11 +61,19 @@ fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
         spans.push(Span::styled("Sort: ", Style::default().fg(app.theme.muted)));
         x_offset += 6;
 
-        let sort_buttons = [
-            (SortField::Date, "Date"),
-            (SortField::Cost, "Cost"),
-            (SortField::Tokens, "Tokens"),
-        ];
+        let sort_buttons = if is_now {
+            [
+                (SortField::Date, "Date"),
+                (SortField::Cost, "Total"),
+                (SortField::Tokens, "Recent"),
+            ]
+        } else {
+            [
+                (SortField::Date, "Date"),
+                (SortField::Cost, "Cost"),
+                (SortField::Tokens, "Tokens"),
+            ]
+        };
 
         for (field, label) in sort_buttons {
             let is_active = app.sort_field == field;
@@ -111,39 +120,61 @@ fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    // Total tokens
-    let total_tokens = app.data.total_tokens;
-    right_spans.push(Span::styled(
-        format_tokens(total_tokens),
-        Style::default().fg(Color::Cyan),
-    ));
-    if !is_very_narrow {
+    if is_now {
         right_spans.push(Span::styled(
-            " tokens",
-            Style::default().fg(app.theme.muted),
+            format!("{} live", app.data.now_sessions.len()),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
-    }
 
-    right_spans.push(Span::styled(" | ", Style::default().fg(app.theme.muted)));
-
-    // Total cost
-    right_spans.push(Span::styled(
-        format_cost(app.data.total_cost),
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-    ));
-
-    // Current list count
-    if !is_very_narrow {
-        let count_label = match app.current_tab {
-            Tab::Agents => format!(" ({} agents)", app.data.agents.len()),
-            _ => format!(" ({} models)", app.data.models.len()),
-        };
+        if !is_very_narrow {
+            right_spans.push(Span::styled(" | ", Style::default().fg(app.theme.muted)));
+            right_spans.push(Span::styled(
+                format!(
+                    "s {}  st {}  p {}  i {}",
+                    app.data.now_phase_counts.streaming,
+                    app.data.now_phase_counts.settling,
+                    app.data.now_phase_counts.preparing,
+                    app.data.now_phase_counts.idle
+                ),
+                Style::default().fg(app.theme.muted),
+            ));
+        }
+    } else {
+        // Total tokens
+        let total_tokens = app.data.total_tokens;
         right_spans.push(Span::styled(
-            count_label,
-            Style::default().fg(app.theme.muted),
+            format_tokens(total_tokens),
+            Style::default().fg(Color::Cyan),
         ));
+        if !is_very_narrow {
+            right_spans.push(Span::styled(
+                " tokens",
+                Style::default().fg(app.theme.muted),
+            ));
+        }
+
+        right_spans.push(Span::styled(" | ", Style::default().fg(app.theme.muted)));
+
+        // Total cost
+        right_spans.push(Span::styled(
+            format_cost(app.data.total_cost),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+        if !is_very_narrow {
+            let count_label = match app.current_tab {
+                Tab::Agents => format!(" ({} agents)", app.data.agents.len()),
+                _ => format!(" ({} models)", app.data.models.len()),
+            };
+            right_spans.push(Span::styled(
+                count_label,
+                Style::default().fg(app.theme.muted),
+            ));
+        }
     }
 
     let right_line = Line::from(right_spans);
@@ -153,6 +184,7 @@ fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
     let is_very_narrow = app.is_very_narrow();
+    let is_now = app.current_tab == Tab::Now;
 
     let spans = if is_very_narrow {
         let mut spans = vec![
@@ -164,14 +196,18 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("·", Style::default().fg(app.theme.muted)),
             Span::styled("[s]", Style::default().fg(Color::Cyan)),
             Span::styled("·", Style::default().fg(app.theme.muted)),
-            Span::styled("[g]", Style::default().fg(Color::Cyan)),
-            Span::styled("·", Style::default().fg(app.theme.muted)),
             Span::styled("[p]", Style::default().fg(Color::Magenta)),
+            Span::styled("·", Style::default().fg(app.theme.muted)),
+            Span::styled("[R]", Style::default().fg(Color::Green)),
             Span::styled("·", Style::default().fg(app.theme.muted)),
             Span::styled("[r]", Style::default().fg(Color::Yellow)),
             Span::styled("·", Style::default().fg(app.theme.muted)),
             Span::styled("q", Style::default().fg(app.theme.muted)),
         ];
+        if !is_now {
+            spans.insert(8, Span::styled("·", Style::default().fg(app.theme.muted)));
+            spans.insert(9, Span::styled("[g]", Style::default().fg(Color::Cyan)));
+        }
         if app.current_tab == Tab::Daily {
             spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
             spans.push(Span::styled("j", Style::default().fg(Color::Yellow)));
@@ -197,24 +233,30 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
             "[s:sources]",
             Style::default().fg(Color::Cyan),
         ));
-        spans.push(Span::styled(" ", Style::default()));
-        spans.push(Span::styled(
-            format!("[g:{}]", app.group_by.borrow()),
-            Style::default().fg(Color::Cyan),
-        ));
-        spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
+        if !is_now {
+            spans.push(Span::styled(" ", Style::default()));
+            spans.push(Span::styled(
+                format!("[g:{}]", app.group_by.borrow()),
+                Style::default().fg(Color::Cyan),
+            ));
+            spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
+        } else {
+            spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
+        }
         spans.push(Span::styled(
             format!("[p:{}]", app.theme.name.as_str()),
             Style::default().fg(Color::Magenta),
         ));
         spans.push(Span::styled(" ", Style::default()));
         spans.push(Span::styled(
-            if app.auto_refresh {
+            if is_now {
+                "[R:hist auto]".to_string()
+            } else if app.auto_refresh {
                 format!("[R:auto {}s]", app.auto_refresh_interval.as_secs())
             } else {
                 "[R:auto off]".to_string()
             },
-            Style::default().fg(if app.auto_refresh {
+            Style::default().fg(if is_now || app.auto_refresh {
                 Color::Green
             } else {
                 app.theme.muted
@@ -271,7 +313,12 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     } else {
-        let elapsed = app.last_refresh.elapsed();
+        let is_now = app.current_tab == Tab::Now;
+        let elapsed = if is_now {
+            app.last_now_refresh.elapsed()
+        } else {
+            app.last_refresh.elapsed()
+        };
         let ago = if elapsed.as_secs() < 60 {
             format!("{}s ago", elapsed.as_secs())
         } else if elapsed.as_secs() < 3600 {
@@ -280,11 +327,26 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
             format!("{}h ago", elapsed.as_secs() / 3600)
         };
         spans.push(Span::styled(
-            format!("Last updated: {}", ago),
+            if is_now {
+                format!("Live snapshot: {}", ago)
+            } else {
+                format!("Last updated: {}", ago)
+            },
             Style::default().fg(app.theme.muted),
         ));
 
-        if app.auto_refresh {
+        if is_now {
+            spans.push(Span::styled(
+                " • Live: 2s poll",
+                Style::default().fg(app.theme.muted),
+            ));
+            if app.now_loading {
+                spans.push(Span::styled(
+                    " • refreshing",
+                    Style::default().fg(Color::Green),
+                ));
+            }
+        } else if app.auto_refresh {
             spans.push(Span::styled(
                 format!(" • Auto: {}s", app.auto_refresh_interval.as_secs()),
                 Style::default().fg(app.theme.muted),

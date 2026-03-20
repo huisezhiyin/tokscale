@@ -8,10 +8,16 @@ use super::utils::{
 };
 use super::UnifiedMessage;
 use crate::TokenBreakdown;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+
+const STREAMING_WINDOW_MS: i64 = 3_000;
+const SETTLING_WINDOW_MS: i64 = 20_000;
+const PREPARING_WINDOW_MS: i64 = 5_000;
+pub const RECENT_TOKENS_WINDOW_MS: i64 = 60_000;
+pub const ACTIVE_SESSION_WINDOW_MS: i64 = 10 * 60 * 1000;
 
 /// Codex entry structure (from JSONL files)
 #[derive(Debug, Deserialize)]
@@ -28,6 +34,7 @@ pub struct CodexPayload {
     pub payload_type: Option<String>,
     pub model: Option<String>,
     pub model_name: Option<String>,
+    pub cwd: Option<String>,
     pub model_info: Option<CodexModelInfo>,
     pub info: Option<CodexInfo>,
     pub source: Option<String>,
@@ -65,6 +72,73 @@ struct CodexTotals {
     output: i64,
     cached: i64,
     reasoning: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexActivityPhase {
+    Streaming,
+    Settling,
+    Preparing,
+    Idle,
+}
+
+impl CodexActivityPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Streaming => "streaming",
+            Self::Settling => "settling",
+            Self::Preparing => "preparing",
+            Self::Idle => "idle",
+        }
+    }
+
+    pub fn priority(self) -> u8 {
+        match self {
+            Self::Streaming => 0,
+            Self::Settling => 1,
+            Self::Preparing => 2,
+            Self::Idle => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSessionKind {
+    Interactive,
+    Headless,
+}
+
+impl CodexSessionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Headless => "headless",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexCurrentSession {
+    pub client: String,
+    pub session_id: String,
+    pub model_id: String,
+    pub provider_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
+    pub session_kind: CodexSessionKind,
+    pub phase: CodexActivityPhase,
+    pub last_event_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_token_at: Option<i64>,
+    pub total_tokens: i64,
+    pub recent_tokens: i64,
 }
 
 impl CodexTotals {
@@ -207,84 +281,13 @@ pub fn parse_codex_file(path: &Path) -> Vec<UnifiedMessage> {
                 if entry.entry_type == "event_msg"
                     && payload.payload_type.as_deref() == Some("token_count")
                 {
-                    // Try to extract model from payload
-                    if let Some(model) = extract_model(&payload) {
-                        current_model = Some(model);
-                    }
-
-                    let info = match payload.info {
-                        Some(i) => i,
-                        None => continue,
-                    };
-
-                    // Try to extract model from info
-                    if let Some(model) = info.model.clone().or(info.model_name.clone()) {
-                        current_model = Some(model);
-                    }
-
-                    let model = current_model
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string());
-
-                    // Use last_token_usage as the primary increment source.
-                    // Upstream totals are mutable snapshots (compaction, context-window
-                    // capping can rewrite them), so we only use total_token_usage for
-                    // dedup and monotonicity checks — never as a direct delta source.
-                    let total_usage = info.total_token_usage.as_ref().map(CodexTotals::from_usage);
-                    let last_usage = info.last_token_usage.as_ref().map(CodexTotals::from_usage);
-
-                    let (tokens, next_totals) = match (total_usage, last_usage, previous_totals) {
-                        // Both present with previous baseline (standard path)
-                        (Some(total), Some(last), Some(previous)) => {
-                            if total == previous {
-                                continue;
-                            }
-                            if total.delta_from(previous).is_none()
-                                && total.looks_like_stale_regression(previous, last)
-                            {
-                                continue;
-                            }
-                            (last.into_tokens(), Some(total))
-                        }
-                        // Both present, first event — use last (NOT full total) to
-                        // avoid overcounting tokens carried from a resumed session.
-                        (Some(total), Some(last), None) => (last.into_tokens(), Some(total)),
-                        // Only total, have previous (defensive — upstream schema
-                        // requires both when info is present)
-                        (Some(total), None, Some(previous)) => {
-                            if total == previous {
-                                continue;
-                            }
-                            if let Some(delta) = total.delta_from(previous) {
-                                (delta.into_tokens(), Some(total))
-                            } else {
-                                previous_totals = Some(total);
-                                continue;
-                            }
-                        }
-                        // Only total, first event, no last — legacy/degraded path
-                        (Some(total), None, None) => (total.into_tokens(), Some(total)),
-                        // Only last, have previous
-                        (None, Some(last), Some(previous)) => {
-                            (last.into_tokens(), Some(previous.saturating_add(last)))
-                        }
-                        // Only last, no previous
-                        (None, Some(last), None) => (last.into_tokens(), None),
-                        // Neither
-                        (None, None, _) => continue,
-                    };
-
-                    // Skip zero-token snapshots without advancing the baseline so
-                    // that post-compaction zero totals don't inflate later deltas.
-                    if tokens.input == 0
-                        && tokens.output == 0
-                        && tokens.cache_read == 0
-                        && tokens.reasoning == 0
-                    {
+                    let Some((model, tokens)) = parse_token_count_payload(
+                        &payload,
+                        &mut current_model,
+                        &mut previous_totals,
+                    ) else {
                         continue;
-                    }
-
-                    previous_totals = next_totals;
+                    };
 
                     let timestamp = entry
                         .timestamp
@@ -336,6 +339,225 @@ pub fn parse_codex_file(path: &Path) -> Vec<UnifiedMessage> {
     messages
 }
 
+pub fn parse_codex_current_session(
+    path: &Path,
+    now_ms: i64,
+    path_is_headless: bool,
+) -> Option<CodexCurrentSession> {
+    let file = std::fs::File::open(path).ok()?;
+
+    let session_id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let fallback_timestamp = file_modified_timestamp_ms(path);
+
+    let mut current_model: Option<String> = None;
+    let mut previous_totals: Option<CodexTotals> = None;
+    let mut session_is_headless = path_is_headless;
+    let mut session_provider: Option<String> = None;
+    let mut session_agent: Option<String> = None;
+    let mut session_cwd: Option<String> = None;
+    let mut last_event_at: Option<i64> = None;
+    let mut last_token_at: Option<i64> = None;
+    let mut total_tokens = 0_i64;
+    let mut recent_tokens = 0_i64;
+
+    let reader = BufReader::new(file);
+    let mut buffer = Vec::with_capacity(4096);
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let mut handled = false;
+        buffer.clear();
+        buffer.extend_from_slice(trimmed.as_bytes());
+        if let Ok(entry) = simd_json::from_slice::<CodexEntry>(&mut buffer) {
+            let timestamp = entry
+                .timestamp
+                .as_deref()
+                .and_then(super::utils::parse_timestamp_str)
+                .unwrap_or(fallback_timestamp);
+            last_event_at = Some(last_event_at.map_or(timestamp, |prev| prev.max(timestamp)));
+
+            if let Some(payload) = entry.payload {
+                if entry.entry_type == "session_meta" {
+                    if payload.source.as_deref() == Some("exec") {
+                        session_is_headless = true;
+                    }
+                    if let Some(provider) =
+                        payload.model_provider.as_ref().filter(|s| !s.is_empty())
+                    {
+                        session_provider = Some(provider.clone());
+                    }
+                    if let Some(agent) = payload.agent_nickname.as_ref().filter(|s| !s.is_empty()) {
+                        session_agent = Some(agent.clone());
+                    }
+                    if let Some(cwd) = payload.cwd.as_ref().filter(|s| !s.is_empty()) {
+                        session_cwd = Some(cwd.clone());
+                    }
+                    handled = true;
+                }
+
+                if entry.entry_type == "turn_context" {
+                    if let Some(model) = extract_model(&payload) {
+                        current_model = Some(model);
+                    }
+                    if let Some(cwd) = payload.cwd.as_ref().filter(|s| !s.is_empty()) {
+                        session_cwd = Some(cwd.clone());
+                    }
+                    handled = true;
+                }
+
+                if entry.entry_type == "event_msg"
+                    && payload.payload_type.as_deref() == Some("token_count")
+                {
+                    if let Some(cwd) = payload.cwd.as_ref().filter(|s| !s.is_empty()) {
+                        session_cwd = Some(cwd.clone());
+                    }
+                    if let Some((model, tokens)) = parse_token_count_payload(
+                        &payload,
+                        &mut current_model,
+                        &mut previous_totals,
+                    ) {
+                        current_model = Some(model);
+                        let token_total = tokens.total();
+                        total_tokens = total_tokens.saturating_add(token_total);
+                        if age_ms(now_ms, timestamp) <= RECENT_TOKENS_WINDOW_MS {
+                            recent_tokens = recent_tokens.saturating_add(token_total);
+                        }
+                        last_token_at =
+                            Some(last_token_at.map_or(timestamp, |prev| prev.max(timestamp)));
+                    }
+                    handled = true;
+                }
+            }
+
+            if handled {
+                continue;
+            }
+        }
+
+        if let Some(event) = parse_codex_headless_event(trimmed, fallback_timestamp) {
+            last_event_at =
+                Some(last_event_at.map_or(event.timestamp, |prev| prev.max(event.timestamp)));
+
+            if let Some(model) = event.model {
+                current_model = Some(model);
+            }
+
+            let token_total = event.tokens.total();
+            if token_total > 0 {
+                total_tokens = total_tokens.saturating_add(token_total);
+                if age_ms(now_ms, event.timestamp) <= RECENT_TOKENS_WINDOW_MS {
+                    recent_tokens = recent_tokens.saturating_add(token_total);
+                }
+                last_token_at =
+                    Some(last_token_at.map_or(event.timestamp, |prev| prev.max(event.timestamp)));
+            }
+        }
+    }
+
+    let last_event_at = last_event_at?;
+    if age_ms(now_ms, last_event_at) > ACTIVE_SESSION_WINDOW_MS {
+        return None;
+    }
+
+    let session_kind = if session_is_headless {
+        CodexSessionKind::Headless
+    } else {
+        CodexSessionKind::Interactive
+    };
+
+    Some(CodexCurrentSession {
+        client: "codex".to_string(),
+        session_id,
+        model_id: current_model.unwrap_or_else(|| "unknown".to_string()),
+        provider_id: session_provider.unwrap_or_else(|| "openai".to_string()),
+        agent: codex_agent_name(session_is_headless, &session_agent),
+        repo_name: repo_name_from_cwd(session_cwd.as_deref()),
+        cwd: session_cwd,
+        session_kind,
+        phase: derive_phase(now_ms, last_event_at, last_token_at),
+        last_event_at,
+        last_token_at,
+        total_tokens,
+        recent_tokens,
+    })
+}
+
+fn parse_token_count_payload(
+    payload: &CodexPayload,
+    current_model: &mut Option<String>,
+    previous_totals: &mut Option<CodexTotals>,
+) -> Option<(String, TokenBreakdown)> {
+    if let Some(model) = extract_model(payload) {
+        *current_model = Some(model);
+    }
+
+    let info = payload.info.as_ref()?;
+
+    if let Some(model) = info.model.clone().or(info.model_name.clone()) {
+        *current_model = Some(model);
+    }
+
+    let model = current_model
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let total_usage = info.total_token_usage.as_ref().map(CodexTotals::from_usage);
+    let last_usage = info.last_token_usage.as_ref().map(CodexTotals::from_usage);
+
+    let (tokens, next_totals) = match (total_usage, last_usage, *previous_totals) {
+        (Some(total), Some(last), Some(previous)) => {
+            if total == previous {
+                return None;
+            }
+            if total.delta_from(previous).is_none()
+                && total.looks_like_stale_regression(previous, last)
+            {
+                return None;
+            }
+            (last.into_tokens(), Some(total))
+        }
+        (Some(total), Some(last), None) => (last.into_tokens(), Some(total)),
+        (Some(total), None, Some(previous)) => {
+            if total == previous {
+                return None;
+            }
+            if let Some(delta) = total.delta_from(previous) {
+                (delta.into_tokens(), Some(total))
+            } else {
+                *previous_totals = Some(total);
+                return None;
+            }
+        }
+        (Some(total), None, None) => (total.into_tokens(), Some(total)),
+        (None, Some(last), Some(previous)) => {
+            (last.into_tokens(), Some(previous.saturating_add(last)))
+        }
+        (None, Some(last), None) => (last.into_tokens(), None),
+        (None, None, _) => return None,
+    };
+
+    if tokens.input == 0 && tokens.output == 0 && tokens.cache_read == 0 && tokens.reasoning == 0 {
+        return None;
+    }
+
+    *previous_totals = next_totals;
+
+    Some((model, tokens))
+}
+
 fn extract_model(payload: &CodexPayload) -> Option<String> {
     payload
         .model_info
@@ -364,6 +586,12 @@ struct CodexHeadlessUsage {
     timestamp_ms: Option<i64>,
 }
 
+struct CodexHeadlessEvent {
+    model: Option<String>,
+    timestamp: i64,
+    tokens: TokenBreakdown,
+}
+
 fn parse_codex_headless_line(
     line: &str,
     session_id: &str,
@@ -373,23 +601,15 @@ fn parse_codex_headless_line(
     session_agent: &Option<String>,
     session_is_headless: bool,
 ) -> Option<UnifiedMessage> {
-    let mut bytes = line.as_bytes().to_vec();
-    let value: Value = simd_json::from_slice(&mut bytes).ok()?;
-
-    if let Some(model) = extract_model_from_value(&value) {
+    let event = parse_codex_headless_event(line, fallback_timestamp)?;
+    if let Some(model) = event.model.clone() {
         *current_model = Some(model);
     }
 
-    let usage = extract_headless_usage(&value)?;
-    let model = usage
+    let model = event
         .model
         .or_else(|| current_model.clone())
         .unwrap_or_else(|| "unknown".to_string());
-    let timestamp = usage.timestamp_ms.unwrap_or(fallback_timestamp);
-
-    if usage.input == 0 && usage.output == 0 && usage.cached == 0 {
-        return None;
-    }
 
     let provider = session_provider.unwrap_or("openai");
     let agent = if session_is_headless {
@@ -403,17 +623,37 @@ fn parse_codex_headless_line(
         model,
         provider,
         session_id.to_string(),
+        event.timestamp,
+        event.tokens,
+        0.0,
+        agent,
+    ))
+}
+
+fn parse_codex_headless_event(line: &str, fallback_timestamp: i64) -> Option<CodexHeadlessEvent> {
+    let mut bytes = line.as_bytes().to_vec();
+    let value: Value = simd_json::from_slice(&mut bytes).ok()?;
+
+    let model = extract_model_from_value(&value)
+        .or_else(|| value.get("data").and_then(extract_model_from_value));
+    let usage = extract_headless_usage(&value)?;
+    let timestamp = usage.timestamp_ms.unwrap_or(fallback_timestamp);
+
+    if usage.input == 0 && usage.output == 0 && usage.cached == 0 {
+        return None;
+    }
+
+    Some(CodexHeadlessEvent {
+        model: usage.model.or(model),
         timestamp,
-        TokenBreakdown {
+        tokens: TokenBreakdown {
             input: usage.input.max(0),
             output: usage.output.max(0),
             cache_read: usage.cached.max(0),
             cache_write: 0,
             reasoning: 0,
         },
-        0.0,
-        agent,
-    ))
+    })
 }
 
 fn codex_agent_name(session_is_headless: bool, session_agent: &Option<String>) -> Option<String> {
@@ -484,6 +724,46 @@ fn extract_timestamp_from_value(value: &Value) -> Option<i64> {
         .or_else(|| value.get("created_at"))
         .or_else(|| value.get("data").and_then(|data| data.get("timestamp")))
         .and_then(parse_timestamp_value)
+}
+
+fn repo_name_from_cwd(cwd: Option<&str>) -> Option<String> {
+    let cwd = cwd?;
+    let trimmed = cwd.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn age_ms(now_ms: i64, timestamp_ms: i64) -> i64 {
+    if now_ms >= timestamp_ms {
+        now_ms - timestamp_ms
+    } else {
+        0
+    }
+}
+
+fn derive_phase(now_ms: i64, last_event_at: i64, last_token_at: Option<i64>) -> CodexActivityPhase {
+    if let Some(last_token_at) = last_token_at {
+        let token_age = age_ms(now_ms, last_token_at);
+        if token_age <= STREAMING_WINDOW_MS {
+            return CodexActivityPhase::Streaming;
+        }
+        if token_age <= SETTLING_WINDOW_MS {
+            return CodexActivityPhase::Settling;
+        }
+    }
+
+    if age_ms(now_ms, last_event_at) <= PREPARING_WINDOW_MS {
+        CodexActivityPhase::Preparing
+    } else {
+        CodexActivityPhase::Idle
+    }
 }
 
 #[cfg(test)]
@@ -915,5 +1195,68 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, "gpt-4o");
+    }
+
+    #[test]
+    fn test_parse_codex_current_session_streaming_with_repo_and_recent_tokens() {
+        let content = concat!(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"source":"interactive","model_provider":"openai","cwd":"/tmp/tokscale","agent_nickname":"Codex"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.3-codex"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:58Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#
+        );
+        let file = create_test_file(content);
+
+        let session = parse_codex_current_session(file.path(), 1_767_225_660_000, false).unwrap();
+
+        assert_eq!(session.model_id, "gpt-5.3-codex");
+        assert_eq!(session.provider_id, "openai");
+        assert_eq!(session.cwd.as_deref(), Some("/tmp/tokscale"));
+        assert_eq!(session.repo_name.as_deref(), Some("tokscale"));
+        assert_eq!(session.session_kind, CodexSessionKind::Interactive);
+        assert_eq!(session.phase, CodexActivityPhase::Streaming);
+        assert_eq!(session.total_tokens, 13);
+        assert_eq!(session.recent_tokens, 13);
+    }
+
+    #[test]
+    fn test_parse_codex_current_session_preparing_without_tokens() {
+        let content = concat!(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"source":"interactive","cwd":"/tmp/project"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:04Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#
+        );
+        let file = create_test_file(content);
+
+        let session = parse_codex_current_session(file.path(), 1_767_225_608_000, false).unwrap();
+
+        assert_eq!(session.phase, CodexActivityPhase::Preparing);
+        assert_eq!(session.total_tokens, 0);
+        assert_eq!(session.last_token_at, None);
+    }
+
+    #[test]
+    fn test_parse_codex_current_session_ignores_old_sessions() {
+        let content = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#;
+        let file = create_test_file(content);
+
+        let session = parse_codex_current_session(file.path(), 1_767_226_201_000, false);
+
+        assert!(session.is_none());
+    }
+
+    #[test]
+    fn test_parse_codex_current_session_marks_headless_from_path() {
+        let content = r#"{"type":"turn.completed","model":"gpt-4o-mini","usage":{"input_tokens":120,"cached_input_tokens":20,"output_tokens":30}}"#;
+        let file = create_test_file(content);
+
+        let session =
+            parse_codex_current_session(file.path(), chrono::Utc::now().timestamp_millis(), true)
+                .unwrap();
+
+        assert_eq!(session.session_kind, CodexSessionKind::Headless);
+        assert_eq!(session.agent.as_deref(), Some("headless"));
+        assert_eq!(session.total_tokens, 150);
     }
 }

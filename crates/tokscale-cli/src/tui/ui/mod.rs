@@ -5,6 +5,7 @@ pub mod dialog;
 mod footer;
 mod header;
 mod models;
+mod now;
 mod overview;
 pub mod spinner;
 mod stats;
@@ -41,6 +42,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_error(frame, app, chunks[1], error);
     } else {
         match app.current_tab {
+            Tab::Now => now::render(frame, app, chunks[1]),
             Tab::Overview => overview::render(frame, app, chunks[1]),
             Tab::Models => models::render(frame, app, chunks[1]),
             Tab::Agents => agents::render(frame, app, chunks[1]),

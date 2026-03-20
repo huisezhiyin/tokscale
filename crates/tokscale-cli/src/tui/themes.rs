@@ -2,6 +2,7 @@ use ratatui::style::Color;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeName {
+    Phosphor,
     Green,
     Halloween,
     Teal,
@@ -16,6 +17,7 @@ pub enum ThemeName {
 impl ThemeName {
     pub fn all() -> &'static [ThemeName] {
         &[
+            ThemeName::Phosphor,
             ThemeName::Green,
             ThemeName::Halloween,
             ThemeName::Teal,
@@ -36,6 +38,7 @@ impl ThemeName {
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            ThemeName::Phosphor => "phosphor",
             ThemeName::Green => "green",
             ThemeName::Halloween => "halloween",
             ThemeName::Teal => "teal",
@@ -54,6 +57,7 @@ impl std::str::FromStr for ThemeName {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "phosphor" => Ok(ThemeName::Phosphor),
             "green" => Ok(ThemeName::Green),
             "halloween" => Ok(ThemeName::Halloween),
             "teal" => Ok(ThemeName::Teal),
@@ -84,6 +88,13 @@ pub struct Theme {
 impl Theme {
     pub fn from_name(name: ThemeName) -> Self {
         let colors = match name {
+            ThemeName::Phosphor => [
+                Color::Rgb(11, 16, 12),    // grade0: empty
+                Color::Rgb(71, 119, 62),   // grade1
+                Color::Rgb(112, 176, 88),  // grade2
+                Color::Rgb(158, 230, 109), // grade3
+                Color::Rgb(214, 255, 171), // grade4
+            ],
             // Colors match frontend contribution graph palettes (higher grade = darker = more activity)
             ThemeName::Green => [
                 Color::Rgb(22, 27, 34),    // grade0: empty
@@ -150,16 +161,35 @@ impl Theme {
             ],
         };
 
+        let (background, foreground, border, muted, accent, selection) = match name {
+            ThemeName::Phosphor => (
+                Color::Rgb(8, 12, 9),
+                Color::Rgb(198, 255, 182),
+                Color::Rgb(42, 67, 42),
+                Color::Rgb(99, 137, 96),
+                Color::Rgb(158, 230, 109),
+                Color::Rgb(20, 36, 21),
+            ),
+            _ => (
+                Color::Rgb(13, 17, 23),
+                Color::Rgb(201, 209, 217),
+                Color::Rgb(48, 54, 61),
+                Color::Rgb(139, 148, 158),
+                Color::Cyan,
+                Color::Rgb(48, 54, 61),
+            ),
+        };
+
         Self {
             name,
             colors,
-            background: Color::Rgb(13, 17, 23),
-            foreground: Color::Rgb(201, 209, 217),
-            border: Color::Rgb(48, 54, 61),
+            background,
+            foreground,
+            border,
             highlight: colors[4],
-            muted: Color::Rgb(139, 148, 158),
-            accent: Color::Cyan,
-            selection: Color::Rgb(48, 54, 61),
+            muted,
+            accent,
+            selection,
         }
     }
 }

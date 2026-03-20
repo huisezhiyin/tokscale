@@ -10,7 +10,7 @@ mod ui;
 
 pub use app::{App, Tab, TuiConfig};
 pub use cache::{load_cache, save_cached_data, CacheResult};
-pub use data::{DataLoader, UsageData};
+pub use data::{DataLoader, NowData, UsageData};
 pub use event::{Event, EventHandler};
 
 use std::collections::HashSet;
@@ -121,7 +121,24 @@ pub fn run(
     };
 
     let (bg_tx, bg_rx) = mpsc::channel::<Result<UsageData>>();
+    let (now_tx, now_rx) = mpsc::channel::<Result<NowData>>();
     let needs_background_load = !has_cached_data || cache_is_stale;
+
+    if enabled_clients.contains(&ClientId::Codex) {
+        app.set_now_loading(true);
+
+        let tx = now_tx.clone();
+        let now_clients: Vec<ClientId> = enabled_clients.iter().copied().collect();
+        let now_since = since.clone();
+        let now_until = until.clone();
+        let now_year = year.clone();
+
+        thread::spawn(move || {
+            let loader = DataLoader::with_filters(None, now_since, now_until, now_year);
+            let result = loader.load_now_data(&now_clients);
+            let _ = tx.send(result);
+        });
+    }
 
     if needs_background_load {
         app.set_background_loading(true);
@@ -162,6 +179,8 @@ pub fn run(
         &mut events,
         bg_tx,
         bg_rx,
+        now_tx,
+        now_rx,
         #[cfg(unix)]
         &sigcont_flag,
     );
@@ -192,6 +211,8 @@ fn run_loop_with_background(
     events: &mut EventHandler,
     bg_tx: mpsc::Sender<Result<UsageData>>,
     bg_rx: mpsc::Receiver<Result<UsageData>>,
+    now_tx: mpsc::Sender<Result<NowData>>,
+    now_rx: mpsc::Receiver<Result<NowData>>,
     #[cfg(unix)] sigcont_flag: &Arc<AtomicBool>,
 ) -> Result<()> {
     loop {
@@ -232,6 +253,26 @@ fn run_loop_with_background(
             Err(TryRecvError::Empty) => {}
         }
 
+        match now_rx.try_recv() {
+            Ok(result) => {
+                app.set_now_loading(false);
+                match result {
+                    Ok(now_data) => {
+                        app.update_now_data(now_data);
+                    }
+                    Err(e) => {
+                        app.set_status(&format!("Live refresh error: {}", e));
+                    }
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                if app.now_loading {
+                    app.set_now_loading(false);
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+
         if app.needs_reload && !app.background_loading {
             app.needs_reload = false;
             app.set_background_loading(true);
@@ -251,6 +292,23 @@ fn run_loop_with_background(
                 if let Ok(ref data) = result {
                     save_cached_data(data, &enabled_clients, include_synthetic);
                 }
+                let _ = tx.send(result);
+            });
+        }
+
+        if app.needs_now_reload && !app.now_loading {
+            app.needs_now_reload = false;
+            app.set_now_loading(true);
+
+            let tx = now_tx.clone();
+            let clients: Vec<ClientId> = app.enabled_clients.borrow().iter().copied().collect();
+            let since = app.data_loader.since.clone();
+            let until = app.data_loader.until.clone();
+            let year = app.data_loader.year.clone();
+
+            thread::spawn(move || {
+                let loader = DataLoader::with_filters(None, since, until, year);
+                let result = loader.load_now_data(&clients);
                 let _ = tx.send(result);
             });
         }

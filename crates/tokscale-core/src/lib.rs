@@ -12,6 +12,7 @@ pub use aggregator::*;
 pub use clients::{ClientCounts, ClientDef, ClientId, PathRoot};
 pub use parser::*;
 pub use scanner::*;
+pub use sessions::codex::{CodexActivityPhase, CodexCurrentSession, CodexSessionKind};
 pub use sessions::UnifiedMessage;
 
 use rayon::prelude::*;
@@ -51,6 +52,62 @@ pub fn normalize_model_for_grouping(model_id: &str) -> String {
     }
 
     name
+}
+
+pub fn get_codex_current_sessions(
+    home_dir: Option<String>,
+) -> Result<Vec<CodexCurrentSession>, String> {
+    get_codex_current_sessions_with_clock(home_dir, chrono::Utc::now().timestamp_millis())
+}
+
+fn get_codex_current_sessions_with_clock(
+    home_dir: Option<String>,
+    now_ms: i64,
+) -> Result<Vec<CodexCurrentSession>, String> {
+    let home_dir = home_dir.unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .to_string_lossy()
+            .to_string()
+    });
+
+    let scan_result = scanner::scan_all_clients(&home_dir, &["codex".to_string()]);
+    let headless_roots = scanner::headless_roots(&home_dir);
+
+    let mut by_session: HashMap<String, CodexCurrentSession> = HashMap::new();
+
+    for path in scan_result
+        .get(ClientId::Codex)
+        .iter()
+        .filter(|path| !path_has_component(path, "archived_sessions"))
+    {
+        let is_headless = is_headless_path(path, &headless_roots);
+        let Some(session) = sessions::codex::parse_codex_current_session(path, now_ms, is_headless)
+        else {
+            continue;
+        };
+
+        match by_session.get_mut(&session.session_id) {
+            Some(existing) if should_replace_current_session(existing, &session) => {
+                *existing = session;
+            }
+            None => {
+                by_session.insert(session.session_id.clone(), session);
+            }
+            _ => {}
+        }
+    }
+
+    let mut sessions: Vec<CodexCurrentSession> = by_session.into_values().collect();
+    sessions.sort_by(|a, b| {
+        a.phase
+            .priority()
+            .cmp(&b.phase.priority())
+            .then_with(|| b.last_event_at.cmp(&a.last_event_at))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+
+    Ok(sessions)
 }
 
 fn retain_for_requested_clients(
@@ -856,6 +913,20 @@ fn is_headless_path(path: &Path, headless_roots: &[PathBuf]) -> bool {
     headless_roots.iter().any(|root| path.starts_with(root))
 }
 
+fn path_has_component(path: &Path, component: &str) -> bool {
+    path.components()
+        .any(|part| part.as_os_str().to_string_lossy() == component)
+}
+
+fn should_replace_current_session(
+    existing: &CodexCurrentSession,
+    candidate: &CodexCurrentSession,
+) -> bool {
+    candidate.last_event_at > existing.last_event_at
+        || (candidate.last_event_at == existing.last_event_at
+            && candidate.phase.priority() < existing.phase.priority())
+}
+
 fn apply_headless_agent(message: &mut UnifiedMessage, is_headless: bool) {
     if is_headless && message.agent.is_none() {
         message.agent = Some("headless".to_string());
@@ -1285,8 +1356,9 @@ mod tests {
     use super::{
         apply_pricing_if_available, normalize_model_for_grouping, parse_all_messages_with_pricing,
         parse_local_clients, pricing, retain_for_requested_clients, select_local_parse_pricing,
-        ClientId, GroupBy, LocalParseOptions, TokenBreakdown, UnifiedMessage,
+        ClientId, CodexActivityPhase, GroupBy, LocalParseOptions, TokenBreakdown, UnifiedMessage,
     };
+    use crate::get_codex_current_sessions_with_clock;
     use std::collections::{HashMap, HashSet};
     use std::str::FromStr;
     use std::sync::Arc;
@@ -1958,5 +2030,67 @@ mod tests {
         assert_eq!(parsed.messages[0].client, "opencode");
         assert_eq!(parsed.messages[0].model_id, "deepseek-v3-0324");
         assert_eq!(parsed.messages[0].provider_id, "fireworks");
+    }
+
+    #[test]
+    fn test_get_codex_current_sessions_filters_archived_and_sorts_by_phase() {
+        use std::fs;
+        use std::io::Write;
+
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        let archived_dir = codex_home.join("archived_sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&archived_dir).unwrap();
+
+        let mut active = fs::File::create(sessions_dir.join("active.jsonl")).unwrap();
+        writeln!(
+            active,
+            r#"{{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{{"model":"gpt-5.3-codex"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            active,
+            r#"{{"timestamp":"2026-01-01T00:00:58Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}}}}}"#
+        )
+        .unwrap();
+
+        let mut preparing = fs::File::create(sessions_dir.join("prep.jsonl")).unwrap();
+        writeln!(
+            preparing,
+            r#"{{"timestamp":"2026-01-01T00:00:57Z","type":"turn_context","payload":{{"model":"gpt-5.2","cwd":"/tmp/prep"}}}}"#
+        )
+        .unwrap();
+
+        let mut archived = fs::File::create(archived_dir.join("old.jsonl")).unwrap();
+        writeln!(
+            archived,
+            r#"{{"timestamp":"2026-01-01T00:00:59Z","type":"turn_context","payload":{{"model":"gpt-4o"}}}}"#
+        )
+        .unwrap();
+
+        let previous_codex_home = std::env::var("CODEX_HOME").ok();
+        unsafe {
+            std::env::set_var("CODEX_HOME", codex_home.to_string_lossy().to_string());
+        }
+
+        let sessions = get_codex_current_sessions_with_clock(
+            Some(home.path().to_string_lossy().to_string()),
+            1_767_225_660_000,
+        );
+
+        match previous_codex_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+
+        let sessions = sessions.unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_id, "active");
+        assert_eq!(sessions[0].phase, CodexActivityPhase::Streaming);
+        assert_eq!(sessions[1].session_id, "prep");
+        assert_eq!(sessions[1].phase, CodexActivityPhase::Preparing);
     }
 }

@@ -7,8 +7,8 @@ use tokio::runtime::{Handle, Runtime};
 
 use tokscale_core::sessions::UnifiedMessage;
 use tokscale_core::{
-    normalize_model_for_grouping, parse_local_unified_messages, sessions, ClientId, GroupBy,
-    LocalParseOptions,
+    get_codex_current_sessions, normalize_model_for_grouping, parse_local_unified_messages,
+    sessions, ClientId, CodexActivityPhase, GroupBy, LocalParseOptions,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -72,6 +72,42 @@ pub struct ContributionDay {
     pub intensity: f64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct NowPhaseCounts {
+    pub streaming: u32,
+    pub settling: u32,
+    pub preparing: u32,
+    pub idle: u32,
+}
+
+impl NowPhaseCounts {
+    pub fn total(&self) -> u32 {
+        self.streaming
+            .saturating_add(self.settling)
+            .saturating_add(self.preparing)
+            .saturating_add(self.idle)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CurrentSession {
+    pub client: String,
+    pub session_id: String,
+    pub model: String,
+    pub provider: String,
+    pub agent: Option<String>,
+    pub cwd: Option<String>,
+    pub repo_name: Option<String>,
+    pub session_kind: String,
+    pub phase: CodexActivityPhase,
+    pub last_event_at_ms: i64,
+    pub last_token_at_ms: Option<i64>,
+    pub last_event_age_seconds: i64,
+    pub last_token_age_seconds: Option<i64>,
+    pub total_tokens: u64,
+    pub recent_tokens: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct GraphData {
     pub weeks: Vec<Vec<Option<ContributionDay>>>,
@@ -85,10 +121,20 @@ pub struct UsageData {
     pub graph: Option<GraphData>,
     pub total_tokens: u64,
     pub total_cost: f64,
+    pub now_sessions: Vec<CurrentSession>,
+    pub now_phase_counts: NowPhaseCounts,
+    pub now_updated_at_ms: Option<i64>,
     pub loading: bool,
     pub error: Option<String>,
     pub current_streak: u32,
     pub longest_streak: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NowData {
+    pub sessions: Vec<CurrentSession>,
+    pub phase_counts: NowPhaseCounts,
+    pub updated_at_ms: Option<i64>,
 }
 
 pub struct DataLoader {
@@ -132,6 +178,7 @@ impl DataLoader {
             .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
             .to_string_lossy()
             .to_string();
+        let now_data = self.load_now_data_with_home(&home, enabled_clients)?;
 
         let mut sources: Vec<String> = enabled_clients
             .iter()
@@ -163,7 +210,78 @@ impl DataLoader {
         }
         .map_err(anyhow::Error::msg)?;
 
-        self.aggregate_messages(messages, group_by)
+        let mut usage = self.aggregate_messages(messages, group_by)?;
+        usage.now_sessions = now_data.sessions;
+        usage.now_phase_counts = now_data.phase_counts;
+        usage.now_updated_at_ms = now_data.updated_at_ms;
+        Ok(usage)
+    }
+
+    pub fn load_now_data(&self, enabled_clients: &[ClientId]) -> Result<NowData> {
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
+            .to_string_lossy()
+            .to_string();
+        self.load_now_data_with_home(&home, enabled_clients)
+    }
+
+    fn load_now_data_with_home(&self, home: &str, enabled_clients: &[ClientId]) -> Result<NowData> {
+        let (sessions, phase_counts, updated_at_ms) =
+            self.load_current_sessions(home, enabled_clients)?;
+        Ok(NowData {
+            sessions,
+            phase_counts,
+            updated_at_ms,
+        })
+    }
+
+    fn load_current_sessions(
+        &self,
+        home: &str,
+        enabled_clients: &[ClientId],
+    ) -> Result<(Vec<CurrentSession>, NowPhaseCounts, Option<i64>)> {
+        if !enabled_clients.contains(&ClientId::Codex) {
+            return Ok((Vec::new(), NowPhaseCounts::default(), None));
+        }
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let sessions =
+            get_codex_current_sessions(Some(home.to_string())).map_err(anyhow::Error::msg)?;
+
+        let mut phase_counts = NowPhaseCounts::default();
+        let mapped_sessions = sessions
+            .into_iter()
+            .map(|session| {
+                match session.phase {
+                    CodexActivityPhase::Streaming => phase_counts.streaming += 1,
+                    CodexActivityPhase::Settling => phase_counts.settling += 1,
+                    CodexActivityPhase::Preparing => phase_counts.preparing += 1,
+                    CodexActivityPhase::Idle => phase_counts.idle += 1,
+                }
+
+                CurrentSession {
+                    client: session.client,
+                    session_id: session.session_id,
+                    model: session.model_id,
+                    provider: session.provider_id,
+                    agent: session.agent,
+                    cwd: session.cwd,
+                    repo_name: session.repo_name,
+                    session_kind: session.session_kind.as_str().to_string(),
+                    phase: session.phase,
+                    last_event_at_ms: session.last_event_at,
+                    last_token_at_ms: session.last_token_at,
+                    last_event_age_seconds: age_seconds(now_ms, session.last_event_at),
+                    last_token_age_seconds: session
+                        .last_token_at
+                        .map(|timestamp| age_seconds(now_ms, timestamp)),
+                    total_tokens: session.total_tokens.max(0) as u64,
+                    recent_tokens: session.recent_tokens.max(0) as u64,
+                }
+            })
+            .collect();
+
+        Ok((mapped_sessions, phase_counts, Some(now_ms)))
     }
 
     fn aggregate_messages(
@@ -404,11 +522,22 @@ impl DataLoader {
             graph: Some(graph),
             total_tokens,
             total_cost,
+            now_sessions: Vec::new(),
+            now_phase_counts: NowPhaseCounts::default(),
+            now_updated_at_ms: None,
             loading: false,
             error: None,
             current_streak,
             longest_streak,
         })
+    }
+}
+
+fn age_seconds(now_ms: i64, timestamp_ms: i64) -> i64 {
+    if now_ms >= timestamp_ms {
+        (now_ms - timestamp_ms) / 1000
+    } else {
+        0
     }
 }
 

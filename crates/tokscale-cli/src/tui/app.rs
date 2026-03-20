@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -8,7 +8,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 use tokscale_core::ClientId;
 
-use super::data::{AgentUsage, DailyUsage, DataLoader, ModelUsage, UsageData};
+use super::data::{
+    AgentUsage, CurrentSession, DailyUsage, DataLoader, ModelUsage, NowData, UsageData,
+};
 use super::settings::Settings;
 use super::themes::{Theme, ThemeName};
 use super::ui::dialog::{ClientPickerDialog, DialogStack};
@@ -27,6 +29,7 @@ pub struct TuiConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
+    Now,
     Overview,
     Models,
     Daily,
@@ -37,6 +40,7 @@ pub enum Tab {
 impl Tab {
     pub fn all() -> &'static [Tab] {
         &[
+            Tab::Now,
             Tab::Overview,
             Tab::Models,
             Tab::Daily,
@@ -47,6 +51,7 @@ impl Tab {
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            Tab::Now => "Now",
             Tab::Overview => "Overview",
             Tab::Models => "Models",
             Tab::Daily => "Daily",
@@ -57,6 +62,7 @@ impl Tab {
 
     pub fn short_name(&self) -> &'static str {
         match self {
+            Tab::Now => "Now",
             Tab::Overview => "Ovw",
             Tab::Models => "Mod",
             Tab::Daily => "Day",
@@ -67,17 +73,19 @@ impl Tab {
 
     pub fn next(self) -> Tab {
         match self {
+            Tab::Now => Tab::Overview,
             Tab::Overview => Tab::Models,
             Tab::Models => Tab::Daily,
             Tab::Daily => Tab::Stats,
             Tab::Stats => Tab::Agents,
-            Tab::Agents => Tab::Overview,
+            Tab::Agents => Tab::Now,
         }
     }
 
     pub fn prev(self) -> Tab {
         match self {
-            Tab::Overview => Tab::Agents,
+            Tab::Now => Tab::Agents,
+            Tab::Overview => Tab::Now,
             Tab::Models => Tab::Overview,
             Tab::Daily => Tab::Models,
             Tab::Stats => Tab::Daily,
@@ -135,6 +143,8 @@ pub struct App {
     pub auto_refresh: bool,
     pub auto_refresh_interval: Duration,
     pub last_refresh: Instant,
+    pub now_refresh_interval: Duration,
+    pub last_now_refresh: Instant,
 
     pub status_message: Option<String>,
     pub status_message_time: Option<Instant>,
@@ -146,9 +156,14 @@ pub struct App {
 
     pub spinner_frame: usize,
 
+    pub now_global_history: VecDeque<u64>,
+    pub now_session_history: HashMap<String, VecDeque<u64>>,
+
     pub background_loading: bool,
+    pub now_loading: bool,
 
     pub needs_reload: bool,
+    pub needs_now_reload: bool,
 
     pub dialog_stack: DialogStack,
 
@@ -199,11 +214,11 @@ impl App {
         );
 
         let data = cached_data.unwrap_or_default();
-        let has_data = !data.models.is_empty();
+        let has_data = !data.models.is_empty() || !data.now_sessions.is_empty();
         let dialog_stack = DialogStack::new(theme.clone());
         let dialog_needs_reload = Rc::new(RefCell::new(false));
 
-        Ok(Self {
+        let mut app = Self {
             should_quit: false,
             current_tab: config.initial_tab.unwrap_or(Tab::Overview),
             theme,
@@ -223,6 +238,8 @@ impl App {
             auto_refresh,
             auto_refresh_interval,
             last_refresh: Instant::now(),
+            now_refresh_interval: Duration::from_secs(2),
+            last_now_refresh: Instant::now(),
             status_message: if has_data {
                 Some("Loaded from cache".to_string())
             } else {
@@ -233,11 +250,19 @@ impl App {
             terminal_height: 24,
             click_areas: Vec::new(),
             spinner_frame: 0,
+            now_global_history: VecDeque::new(),
+            now_session_history: HashMap::new(),
             background_loading: false,
+            now_loading: false,
             needs_reload: false,
+            needs_now_reload: false,
             dialog_stack,
             dialog_needs_reload,
-        })
+        };
+
+        app.record_now_snapshot();
+
+        Ok(app)
     }
 
     pub fn set_background_loading(&mut self, loading: bool) {
@@ -245,14 +270,71 @@ impl App {
         // Don't set data.loading - let cached data remain visible during background refresh
     }
 
+    pub fn set_now_loading(&mut self, loading: bool) {
+        self.now_loading = loading;
+    }
+
     pub fn update_data(&mut self, data: UsageData) {
+        let previous_now_sessions = self.data.now_sessions.clone();
+        let previous_now_phase_counts = self.data.now_phase_counts.clone();
+        let previous_now_updated_at_ms = self.data.now_updated_at_ms;
+
+        let preserve_live_now = previous_now_updated_at_ms
+            .zip(data.now_updated_at_ms)
+            .map(|(current, incoming)| current > incoming)
+            .unwrap_or(previous_now_updated_at_ms.is_some() && data.now_updated_at_ms.is_none());
+
         self.data = data;
+        if preserve_live_now {
+            self.data.now_sessions = previous_now_sessions;
+            self.data.now_phase_counts = previous_now_phase_counts;
+            self.data.now_updated_at_ms = previous_now_updated_at_ms;
+        }
         self.last_refresh = Instant::now();
+        if self.data.now_updated_at_ms.is_some() {
+            self.last_now_refresh = Instant::now();
+        }
+        self.record_now_snapshot();
         self.clamp_selection();
     }
 
+    pub fn update_now_data(&mut self, now_data: NowData) {
+        self.data.now_sessions = now_data.sessions;
+        self.data.now_phase_counts = now_data.phase_counts;
+        self.data.now_updated_at_ms = now_data.updated_at_ms;
+        self.last_now_refresh = Instant::now();
+        self.record_now_snapshot();
+        self.clamp_selection();
+    }
+
+    fn record_now_snapshot(&mut self) {
+        let total_recent: u64 = self
+            .data
+            .now_sessions
+            .iter()
+            .map(|session| session.recent_tokens)
+            .sum();
+        push_history(&mut self.now_global_history, total_recent, 48);
+
+        let mut active_ids = HashSet::new();
+        for session in &self.data.now_sessions {
+            active_ids.insert(session.session_id.clone());
+            let entry = self
+                .now_session_history
+                .entry(session.session_id.clone())
+                .or_default();
+            push_history(entry, session.recent_tokens, 18);
+        }
+
+        self.now_session_history
+            .retain(|session_id, _| active_ids.contains(session_id));
+    }
+
     pub fn has_visible_data(&self) -> bool {
-        !self.data.models.is_empty()
+        !self.data.now_sessions.is_empty()
+            || self.data.now_phase_counts.total() > 0
+            || self.data.now_updated_at_ms.is_some()
+            || !self.data.models.is_empty()
             || !self.data.daily.is_empty()
             || !self.data.agents.is_empty()
             || self.data.graph.is_some()
@@ -281,9 +363,17 @@ impl App {
             self.needs_reload = true;
         }
 
+        if self.current_tab == Tab::Now
+            && !self.now_loading
+            && self.last_now_refresh.elapsed() >= self.now_refresh_interval
+        {
+            self.needs_now_reload = true;
+        }
+
         if *self.dialog_needs_reload.borrow() {
             *self.dialog_needs_reload.borrow_mut() = false;
             self.needs_reload = true;
+            self.needs_now_reload = true;
         }
     }
 
@@ -594,6 +684,7 @@ impl App {
 
     fn get_current_list_len(&self) -> usize {
         match self.current_tab {
+            Tab::Now => self.data.now_sessions.len(),
             Tab::Overview | Tab::Models => self.data.models.len(),
             Tab::Agents => self.data.agents.len(),
             Tab::Daily => self.data.daily.len(),
@@ -738,6 +829,18 @@ impl App {
 
     fn copy_selected_to_clipboard(&mut self) {
         let text = match self.current_tab {
+            Tab::Now => self
+                .get_sorted_now_sessions()
+                .get(self.selected_index)
+                .map(|s| {
+                    format!(
+                        "{} {} {} {}s ago",
+                        s.phase.as_str(),
+                        s.model,
+                        s.repo_name.as_deref().unwrap_or("-"),
+                        s.last_event_age_seconds
+                    )
+                }),
             Tab::Overview | Tab::Models => self
                 .get_sorted_models()
                 .get(self.selected_index)
@@ -804,7 +907,33 @@ impl App {
             "totals": {
                 "tokens": self.data.total_tokens,
                 "cost": self.data.total_cost
-            }
+            },
+            "now": {
+                "updatedAtMs": self.data.now_updated_at_ms,
+                "phaseCounts": {
+                    "streaming": self.data.now_phase_counts.streaming,
+                    "settling": self.data.now_phase_counts.settling,
+                    "preparing": self.data.now_phase_counts.preparing,
+                    "idle": self.data.now_phase_counts.idle
+                },
+                "sessions": self.data.now_sessions.iter().map(|s| serde_json::json!({
+                    "client": s.client,
+                    "sessionId": s.session_id,
+                    "model": s.model,
+                    "provider": s.provider,
+                    "agent": s.agent,
+                    "cwd": s.cwd,
+                    "repoName": s.repo_name,
+                    "sessionKind": s.session_kind,
+                    "phase": s.phase.as_str(),
+                    "lastEventAtMs": s.last_event_at_ms,
+                    "lastTokenAtMs": s.last_token_at_ms,
+                    "lastEventAgeSeconds": s.last_event_age_seconds,
+                    "lastTokenAgeSeconds": s.last_token_age_seconds,
+                    "totalTokens": s.total_tokens,
+                    "recentTokens": s.recent_tokens
+                })).collect::<Vec<_>>()
+            },
         });
 
         let filename = format!(
@@ -938,12 +1067,76 @@ impl App {
         daily
     }
 
+    pub fn get_sorted_now_sessions(&self) -> Vec<&CurrentSession> {
+        let mut sessions: Vec<&CurrentSession> = self.data.now_sessions.iter().collect();
+
+        let tie_breaker = |a: &&CurrentSession, b: &&CurrentSession| {
+            a.phase
+                .priority()
+                .cmp(&b.phase.priority())
+                .then_with(|| b.last_event_at_ms.cmp(&a.last_event_at_ms))
+                .then_with(|| a.model.cmp(&b.model))
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        };
+
+        match (self.sort_field, self.sort_direction) {
+            (SortField::Tokens, SortDirection::Descending) => sessions.sort_by(|a, b| {
+                b.recent_tokens
+                    .cmp(&a.recent_tokens)
+                    .then_with(|| b.total_tokens.cmp(&a.total_tokens))
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Tokens, SortDirection::Ascending) => sessions.sort_by(|a, b| {
+                a.recent_tokens
+                    .cmp(&b.recent_tokens)
+                    .then_with(|| a.total_tokens.cmp(&b.total_tokens))
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Date, SortDirection::Ascending) => sessions.sort_by(|a, b| {
+                a.last_event_at_ms
+                    .cmp(&b.last_event_at_ms)
+                    .then_with(|| a.phase.priority().cmp(&b.phase.priority()))
+                    .then_with(|| a.model.cmp(&b.model))
+            }),
+            (SortField::Date, SortDirection::Descending) => sessions.sort_by(|a, b| {
+                b.last_event_at_ms
+                    .cmp(&a.last_event_at_ms)
+                    .then_with(|| a.phase.priority().cmp(&b.phase.priority()))
+                    .then_with(|| a.model.cmp(&b.model))
+            }),
+            (SortField::Cost, SortDirection::Descending) => sessions.sort_by(|a, b| {
+                b.total_tokens
+                    .cmp(&a.total_tokens)
+                    .then_with(|| b.recent_tokens.cmp(&a.recent_tokens))
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Cost, SortDirection::Ascending) => sessions.sort_by(|a, b| {
+                a.total_tokens
+                    .cmp(&b.total_tokens)
+                    .then_with(|| a.recent_tokens.cmp(&b.recent_tokens))
+                    .then_with(|| tie_breaker(a, b))
+            }),
+        }
+
+        sessions
+    }
+
     pub fn is_narrow(&self) -> bool {
         self.terminal_width < 80
     }
 
     pub fn is_very_narrow(&self) -> bool {
         self.terminal_width < 60
+    }
+}
+
+fn push_history(history: &mut VecDeque<u64>, value: u64, max_len: usize) {
+    if max_len == 0 {
+        return;
+    }
+    history.push_back(value);
+    while history.len() > max_len {
+        history.pop_front();
     }
 }
 
@@ -955,26 +1148,29 @@ mod tests {
     #[test]
     fn test_tab_all() {
         let tabs = Tab::all();
-        assert_eq!(tabs.len(), 5);
-        assert_eq!(tabs[0], Tab::Overview);
-        assert_eq!(tabs[1], Tab::Models);
-        assert_eq!(tabs[2], Tab::Daily);
-        assert_eq!(tabs[3], Tab::Stats);
-        assert_eq!(tabs[4], Tab::Agents);
+        assert_eq!(tabs.len(), 6);
+        assert_eq!(tabs[0], Tab::Now);
+        assert_eq!(tabs[1], Tab::Overview);
+        assert_eq!(tabs[2], Tab::Models);
+        assert_eq!(tabs[3], Tab::Daily);
+        assert_eq!(tabs[4], Tab::Stats);
+        assert_eq!(tabs[5], Tab::Agents);
     }
 
     #[test]
     fn test_tab_next() {
+        assert_eq!(Tab::Now.next(), Tab::Overview);
         assert_eq!(Tab::Overview.next(), Tab::Models);
         assert_eq!(Tab::Models.next(), Tab::Daily);
         assert_eq!(Tab::Daily.next(), Tab::Stats);
         assert_eq!(Tab::Stats.next(), Tab::Agents);
-        assert_eq!(Tab::Agents.next(), Tab::Overview);
+        assert_eq!(Tab::Agents.next(), Tab::Now);
     }
 
     #[test]
     fn test_tab_prev() {
-        assert_eq!(Tab::Overview.prev(), Tab::Agents);
+        assert_eq!(Tab::Now.prev(), Tab::Agents);
+        assert_eq!(Tab::Overview.prev(), Tab::Now);
         assert_eq!(Tab::Models.prev(), Tab::Overview);
         assert_eq!(Tab::Daily.prev(), Tab::Models);
         assert_eq!(Tab::Stats.prev(), Tab::Daily);
@@ -983,6 +1179,7 @@ mod tests {
 
     #[test]
     fn test_tab_as_str() {
+        assert_eq!(Tab::Now.as_str(), "Now");
         assert_eq!(Tab::Overview.as_str(), "Overview");
         assert_eq!(Tab::Models.as_str(), "Models");
         assert_eq!(Tab::Agents.as_str(), "Agents");
@@ -992,6 +1189,7 @@ mod tests {
 
     #[test]
     fn test_tab_short_name() {
+        assert_eq!(Tab::Now.short_name(), "Now");
         assert_eq!(Tab::Overview.short_name(), "Ovw");
         assert_eq!(Tab::Models.short_name(), "Mod");
         assert_eq!(Tab::Agents.short_name(), "Agt");
@@ -1275,6 +1473,9 @@ mod tests {
         assert_eq!(app.current_tab, Tab::Agents);
 
         app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.current_tab, Tab::Now);
+
+        app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.current_tab, Tab::Overview);
     }
 
@@ -1282,6 +1483,9 @@ mod tests {
     fn test_handle_key_backtab_switch() {
         let mut app = make_app();
         assert_eq!(app.current_tab, Tab::Overview);
+
+        app.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(app.current_tab, Tab::Now);
 
         app.handle_key_event(key(KeyCode::BackTab));
         assert_eq!(app.current_tab, Tab::Agents);
@@ -1380,6 +1584,9 @@ mod tests {
 
         app.handle_key_event(key(KeyCode::Left));
         assert_eq!(app.current_tab, Tab::Overview);
+
+        app.handle_key_event(key(KeyCode::Left));
+        assert_eq!(app.current_tab, Tab::Now);
     }
 
     #[test]
@@ -1541,7 +1748,7 @@ mod tests {
         app.handle_key_event(key(KeyCode::Char('p')));
         assert_ne!(app.theme.name, initial_theme);
 
-        for _ in 0..8 {
+        for _ in 0..9 {
             app.handle_key_event(key(KeyCode::Char('p')));
         }
         assert_eq!(app.theme.name, initial_theme);
@@ -1811,6 +2018,51 @@ mod tests {
         app.on_tick();
         assert!(app.status_message.is_some());
         assert_eq!(app.status_message.as_ref().unwrap(), "fresh message");
+    }
+
+    #[test]
+    fn test_on_tick_now_tab_schedules_live_refresh() {
+        let mut app = make_app();
+        app.current_tab = Tab::Now;
+        app.last_now_refresh = Instant::now() - Duration::from_secs(3);
+        app.now_loading = false;
+
+        app.on_tick();
+
+        assert!(app.needs_now_reload);
+    }
+
+    #[test]
+    fn test_update_data_preserves_newer_now_snapshot() {
+        let mut app = make_app();
+        app.data.now_updated_at_ms = Some(2_000);
+        app.data.now_sessions = vec![CurrentSession {
+            client: "codex".to_string(),
+            session_id: "live".to_string(),
+            model: "gpt-5.4".to_string(),
+            provider: "openai".to_string(),
+            agent: Some("Codex".to_string()),
+            cwd: None,
+            repo_name: Some("tokscale".to_string()),
+            session_kind: "interactive".to_string(),
+            phase: tokscale_core::CodexActivityPhase::Streaming,
+            last_event_at_ms: 2_000,
+            last_token_at_ms: Some(2_000),
+            last_event_age_seconds: 0,
+            last_token_age_seconds: Some(0),
+            total_tokens: 200,
+            recent_tokens: 100,
+        }];
+        app.data.now_phase_counts.streaming = 1;
+
+        let mut incoming = UsageData::default();
+        incoming.now_updated_at_ms = Some(1_000);
+
+        app.update_data(incoming);
+
+        assert_eq!(app.data.now_updated_at_ms, Some(2_000));
+        assert_eq!(app.data.now_sessions.len(), 1);
+        assert_eq!(app.data.now_phase_counts.streaming, 1);
     }
 
     // ── click area management ───────────────────────────────────────

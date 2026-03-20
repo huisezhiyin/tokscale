@@ -36,7 +36,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
-            " tokscale ",
+            " tokscale // terminal telemetry ",
             Style::default()
                 .fg(app.theme.accent)
                 .add_modifier(Modifier::BOLD),
@@ -45,11 +45,23 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         .style(Style::default().bg(app.theme.background));
 
     if !is_narrow {
+        let refresh_badge = if app.current_tab == Tab::Now {
+            format!(
+                "[{}] // 2s live poll ",
+                app.current_tab.as_str().to_uppercase()
+            )
+        } else {
+            format!(
+                "[{}] // {}s refresh ",
+                app.current_tab.as_str().to_uppercase(),
+                app.auto_refresh_interval.as_secs()
+            )
+        };
         block = block.title_top(
-            Line::from(vec![
-                Span::styled(" | ", Style::default().fg(Color::Rgb(102, 102, 102))),
-                Span::styled("GitHub ", Style::default().fg(Color::Rgb(102, 102, 102))),
-            ])
+            Line::from(vec![Span::styled(
+                refresh_badge,
+                Style::default().fg(app.theme.muted),
+            )])
             .right_aligned(),
         );
     }

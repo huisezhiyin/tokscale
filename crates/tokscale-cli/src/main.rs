@@ -247,6 +247,22 @@ enum Commands {
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
+    #[command(about = "Show current active sessions")]
+    Now {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(long, help = "Show only Codex CLI usage")]
+        codex: bool,
+        #[arg(long, help = "Refresh continuously")]
+        watch: bool,
+        #[arg(
+            long,
+            default_value = "2",
+            value_name = "SECONDS",
+            help = "Refresh interval for --watch"
+        )]
+        interval: u64,
+    },
     #[command(about = "Login to Tokscale (opens browser for GitHub auth)")]
     Login,
     #[command(about = "Logout from Tokscale")]
@@ -672,6 +688,12 @@ fn main() -> Result<()> {
             no_spinner,
         }) => run_pricing_lookup(&model_id, json, provider.as_deref(), no_spinner),
         Some(Commands::Clients { json }) => run_clients_command(json),
+        Some(Commands::Now {
+            json,
+            codex,
+            watch,
+            interval,
+        }) => run_now_command(json, codex, watch, interval),
         Some(Commands::Login) => run_login_command(),
         Some(Commands::Logout) => run_logout_command(),
         Some(Commands::Whoami) => run_whoami_command(),
@@ -2400,6 +2422,255 @@ fn run_clients_command(json: bool) -> Result<()> {
     Ok(())
 }
 
+fn run_now_command(json: bool, codex: bool, watch: bool, interval: u64) -> Result<()> {
+    if !codex {
+        anyhow::bail!("Only `tokscale now --codex` is supported right now.");
+    }
+
+    if watch && json {
+        anyhow::bail!("`tokscale now --codex --watch` does not support `--json` yet.");
+    }
+
+    let interval = interval.max(1);
+    let home_dir =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    let home_dir = home_dir.to_string_lossy().to_string();
+
+    if watch {
+        loop {
+            let snapshot = collect_now_snapshot(&home_dir)?;
+            render_now_watch_frame(&snapshot, interval)?;
+            std::thread::sleep(Duration::from_secs(interval));
+        }
+    }
+
+    let snapshot = collect_now_snapshot(&home_dir)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&snapshot.to_output())?);
+        return Ok(());
+    }
+
+    render_now_text(&snapshot, false, interval)
+}
+
+fn collect_now_snapshot(home_dir: &str) -> Result<NowSnapshot> {
+    use chrono::Utc;
+    use tokscale_core::get_codex_current_sessions;
+
+    let generated_at = Utc::now();
+    let sessions = get_codex_current_sessions(Some(home_dir.to_string()))
+        .map_err(|err| anyhow::anyhow!(err))?;
+    let phases = count_now_phases(&sessions);
+
+    Ok(NowSnapshot {
+        generated_at,
+        phases,
+        sessions,
+    })
+}
+
+fn render_now_watch_frame(snapshot: &NowSnapshot, interval: u64) -> Result<()> {
+    if io::stdout().is_terminal() {
+        print!("\x1b[2J\x1b[H");
+    } else {
+        println!("\n=== tokscale now --codex watch ===\n");
+    }
+
+    render_now_text(snapshot, true, interval)?;
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn render_now_text(snapshot: &NowSnapshot, watch: bool, interval: u64) -> Result<()> {
+    use colored::Colorize;
+
+    println!("\n  {}", "Codex now".cyan());
+    if watch {
+        println!(
+            "  {}",
+            format!(
+                "live refresh every {}s  updated {}  press Ctrl-C to stop",
+                interval,
+                snapshot
+                    .generated_at
+                    .with_timezone(&chrono::Local)
+                    .format("%H:%M:%S")
+            )
+            .bright_black()
+        );
+    }
+    println!(
+        "  {}",
+        format!(
+            "{} current session{} in the last 10 minutes",
+            snapshot.sessions.len(),
+            if snapshot.sessions.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        )
+        .bright_black()
+    );
+    println!(
+        "  {}",
+        format!(
+            "streaming {}  settling {}  preparing {}  idle {}",
+            snapshot.phases.streaming,
+            snapshot.phases.settling,
+            snapshot.phases.preparing,
+            snapshot.phases.idle
+        )
+        .bright_black()
+    );
+    println!();
+
+    if snapshot.sessions.is_empty() {
+        println!(
+            "  {}\n",
+            "No recent Codex sessions found. This command only includes the last 10 minutes."
+                .bright_black()
+        );
+        return Ok(());
+    }
+
+    for session in &snapshot.sessions {
+        let location = session
+            .repo_name
+            .as_deref()
+            .or(session.cwd.as_deref())
+            .unwrap_or("-");
+        let cwd = session
+            .cwd
+            .as_deref()
+            .map(tilde_path)
+            .unwrap_or_else(|| "-".to_string());
+
+        println!(
+            "  {}  {}  {}",
+            phase_label(session.phase),
+            session.model_id.white().bold(),
+            location.white()
+        );
+        println!(
+            "  {}",
+            format!(
+                "provider: {}  agent: {}  kind: {}  session: {}",
+                session.provider_id,
+                session.agent.as_deref().unwrap_or("-"),
+                session.session_kind.as_str(),
+                session.session_id
+            )
+            .bright_black()
+        );
+        println!(
+            "  {}",
+            format!(
+                "cwd: {}  total: {}  recent: {}  last event: {} ago",
+                cwd,
+                format_tokens_with_commas(session.total_tokens),
+                format_tokens_with_commas(session.recent_tokens),
+                format_age(
+                    snapshot.generated_at.timestamp_millis(),
+                    session.last_event_at
+                )
+            )
+            .bright_black()
+        );
+        println!();
+    }
+
+    Ok(())
+}
+
+struct NowSnapshot {
+    generated_at: chrono::DateTime<chrono::Utc>,
+    phases: NowPhaseCounts,
+    sessions: Vec<tokscale_core::CodexCurrentSession>,
+}
+
+impl NowSnapshot {
+    fn to_output(&self) -> NowOutput {
+        NowOutput {
+            generated_at: self.generated_at.to_rfc3339(),
+            activity_window_seconds: 10 * 60,
+            session_count: self.sessions.len(),
+            phases: self.phases.clone(),
+            sessions: self
+                .sessions
+                .iter()
+                .map(|session| NowSessionRow {
+                    client: session.client.clone(),
+                    session_id: session.session_id.clone(),
+                    model_id: session.model_id.clone(),
+                    provider_id: session.provider_id.clone(),
+                    agent: session.agent.clone(),
+                    cwd: session.cwd.clone(),
+                    repo_name: session.repo_name.clone(),
+                    session_kind: session.session_kind.as_str().to_string(),
+                    phase: session.phase.as_str().to_string(),
+                    last_event_at: format_timestamp(session.last_event_at),
+                    last_token_at: session.last_token_at.map(format_timestamp),
+                    last_event_age_seconds: age_seconds(
+                        self.generated_at.timestamp_millis(),
+                        session.last_event_at,
+                    ),
+                    last_token_age_seconds: session
+                        .last_token_at
+                        .map(|ts| age_seconds(self.generated_at.timestamp_millis(), ts)),
+                    total_tokens: session.total_tokens,
+                    recent_tokens: session.recent_tokens,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NowPhaseCounts {
+    streaming: usize,
+    settling: usize,
+    preparing: usize,
+    idle: usize,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NowSessionRow {
+    client: String,
+    session_id: String,
+    model_id: String,
+    provider_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_name: Option<String>,
+    session_kind: String,
+    phase: String,
+    last_event_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_token_at: Option<String>,
+    last_event_age_seconds: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_token_age_seconds: Option<i64>,
+    total_tokens: i64,
+    recent_tokens: i64,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NowOutput {
+    generated_at: String,
+    activity_window_seconds: i64,
+    session_count: usize,
+    phases: NowPhaseCounts,
+    sessions: Vec<NowSessionRow>,
+}
+
 fn get_headless_roots(home_dir: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
@@ -2427,6 +2698,77 @@ fn describe_path(path: &str, exists: bool) -> String {
         format!("{} ✓", path_display)
     } else {
         format!("{} ✗", path_display)
+    }
+}
+
+fn count_now_phases(sessions: &[tokscale_core::CodexCurrentSession]) -> NowPhaseCounts {
+    let mut counts = NowPhaseCounts {
+        streaming: 0,
+        settling: 0,
+        preparing: 0,
+        idle: 0,
+    };
+
+    for session in sessions {
+        match session.phase {
+            tokscale_core::CodexActivityPhase::Streaming => counts.streaming += 1,
+            tokscale_core::CodexActivityPhase::Settling => counts.settling += 1,
+            tokscale_core::CodexActivityPhase::Preparing => counts.preparing += 1,
+            tokscale_core::CodexActivityPhase::Idle => counts.idle += 1,
+        }
+    }
+
+    counts
+}
+
+fn format_timestamp(timestamp_ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms)
+        .map(|dt| dt.with_timezone(&chrono::Local).to_rfc3339())
+        .unwrap_or_else(|| timestamp_ms.to_string())
+}
+
+fn age_seconds(now_ms: i64, timestamp_ms: i64) -> i64 {
+    if now_ms >= timestamp_ms {
+        (now_ms - timestamp_ms) / 1000
+    } else {
+        0
+    }
+}
+
+fn format_age(now_ms: i64, timestamp_ms: i64) -> String {
+    let seconds = age_seconds(now_ms, timestamp_ms);
+    if seconds < 60 {
+        return format!("{}s", seconds);
+    }
+
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{}m", minutes);
+    }
+
+    let hours = minutes / 60;
+    format!("{}h", hours)
+}
+
+fn tilde_path(path: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy().to_string();
+        if path.starts_with(&home) {
+            return path.replacen(&home, "~", 1);
+        }
+    }
+
+    path.to_string()
+}
+
+fn phase_label(phase: tokscale_core::CodexActivityPhase) -> colored::ColoredString {
+    use colored::Colorize;
+
+    match phase {
+        tokscale_core::CodexActivityPhase::Streaming => "streaming".green().bold(),
+        tokscale_core::CodexActivityPhase::Settling => "settling".yellow().bold(),
+        tokscale_core::CodexActivityPhase::Preparing => "preparing".blue().bold(),
+        tokscale_core::CodexActivityPhase::Idle => "idle".bright_black(),
     }
 }
 
